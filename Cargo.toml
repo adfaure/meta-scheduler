@@ -1,0 +1,12 @@
+[package]
+name = "meta-scheduler"
+version = "0.1.0"
+authors = ["adfaure <adrien.faure2@gmail.com>"]
+
+[dependencies]
+batsim-rs = "0.1.0"
+procset = "0.1.1"
+log = "0.3.7"
+env_logger = "0.4.3"
+regex = "0.2"
+serde_json = "1.0"
