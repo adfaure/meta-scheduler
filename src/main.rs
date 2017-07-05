@@ -11,5 +11,9 @@ mod meta_scheduler;
 mod sub_scheduler;
 
 fn main() {
-    println!("Hello, world!");
+    env_logger::init().unwrap();
+    let mut scheduler = meta_scheduler::MetaScheduler::new();
+    let mut batsim = batsim::Batsim::new(&mut scheduler);
+
+    batsim.run_simulation().unwrap();
 }
