@@ -245,16 +245,6 @@ impl Scheduler for MetaScheduler {
                                  });
         }
 
-        // We notify every scheduler wereas we launch one
-        // of the backfilled jobs.
-        let time: f64 = self.time;
-        for ready_allocation in &backfilled_allocations {
-            self.schedulers_for(ready_allocation.job.clone(),
-                                &|scheduler| {
-                                     scheduler.job_launched(time, ready_allocation.job.id.clone())
-                                 });
-        }
-
         all_allocations.extend(backfilled_allocations);
         events.extend(allocations_to_batsim_events(self.time, all_allocations));
         trace!("Respond to batsim at: {} with {} events",
