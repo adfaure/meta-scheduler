@@ -83,11 +83,11 @@ impl Scheduler for MetaScheduler {
 
         let mut nb_machines_used = 0;
         for idx in 0..nb_grps {
-            let interval = Interval::new(2_u32.pow(idx) as u32, (2_u32.pow(idx + 1) - 1) as u32);
+            let interval = Interval::new(2_u32.pow(idx) as u32 - 1, (2_u32.pow(idx + 1) - 2) as u32);
             let mut scheduler: SubScheduler = SubScheduler::new(interval.clone());
 
             nb_machines_used += interval.range_size();
-            info!("Groupe(n={}) uses {} nodes", idx, interval.range_size());
+            info!("Groupe(n={}) uses {} nodes: {:?}", idx, interval.range_size(), interval);
 
             self.schedulers.insert(idx as usize, scheduler);
         }
@@ -96,11 +96,12 @@ impl Scheduler for MetaScheduler {
               nb_machines_used,
               self.nb_resources - 1);
 
-        self.nb_dangling_resources = (self.nb_resources - 1 - nb_machines_used) as i32;
+        self.nb_dangling_resources = (self.nb_resources - nb_machines_used) as i32;
         if self.nb_dangling_resources <= 0 {
-            panic!("No ressource available for rejection");
+            //panic!("No ressource available for rejection");
         }
 
+        // We tell batsim that it does not need to wait for us
         Some(vec![notify_event(*timestamp, String::from("submission_finished"))])
     }
 
@@ -110,9 +111,9 @@ impl Scheduler for MetaScheduler {
                          profile: Option<Profile>)
                          -> Option<Vec<BatsimEvent>> {
 
-        if job.res >= self.max_job_size as i32 {
+        if job.res > self.max_job_size as i32 {
             trace!("Job too big: {:?}", job);
-            return Some(vec![reject_job_event(*timestamp, &job)])
+            return Some(vec![reject_job_event(*timestamp, &job)]);
         }
 
         // We save the profile of the new job
@@ -136,34 +137,13 @@ impl Scheduler for MetaScheduler {
             }
             _ => {
                 trace!("Get a new job(={:?}) with size {}", job, job.res);
-                let grp_idx = get_job_grp(&job);
                 let job_rc = Rc::new(job);
 
                 self.jobs.insert(job_rc.id.clone(), job_rc.clone());
 
-                if job_rc.res <= self.greater_grp_size as i32 {
-                    self.schedulers
-                        .get_mut(grp_idx)
-                        .ok_or("No scheduler can handle this job")
-                        .unwrap()
-                        .add_job(Rc::new(Allocation::new(job_rc.clone())));
-                } else {
-                    trace!("New huge job has been added {:?}", job_rc);
-                    let nm_res = job_rc.res;
-                    // If the jobs do not fit into any of the sub schedulers
-                    // we send it to schedulers till we have enought cores.
-                    let mut iter_sched = self.schedulers.iter_mut().enumerate().rev();
-                    let mut sched = iter_sched.next().unwrap();
-                    let mut cores_remaining = job_rc.res;
-
-                    let shared_allocation = Rc::new(Allocation::new(job_rc.clone()));
-                    while cores_remaining > 0 && sched.0 > 0 {
-                        sched.1.add_job(shared_allocation.clone());
-
-                        cores_remaining -= 2i32.pow(sched.0 as u32);
-                        sched = iter_sched.next().unwrap();
-                    }
-                }
+                let shared_allocation = Rc::new(Allocation::new(job_rc.clone()));
+                self.schedulers_for(job_rc.clone(),
+                                    &|scheduler| scheduler.add_job(shared_allocation.clone()));
             }
         }
         None
@@ -174,14 +154,12 @@ impl Scheduler for MetaScheduler {
         let finished_job = self.jobs
             .get(&job_id)
             .ok_or("No job registered with this id")
-            .unwrap();
-
-        let grp_idx = get_job_grp(&finished_job);
-        self.schedulers
-            .get_mut(grp_idx)
-            .ok_or("No scheduler can handle this job")
             .unwrap()
-            .job_finished(job_id.clone());
+            .clone();
+
+
+        self.schedulers_for(finished_job.clone(),
+                            &|scheduler| scheduler.job_finished(finished_job.id.clone()));
 
         None
     }
@@ -197,35 +175,73 @@ impl Scheduler for MetaScheduler {
     fn on_message_received_end(&mut self, timestamp: &mut f64) -> Option<Vec<BatsimEvent>> {
         // All events that will be send to batsim (all allocation that are ready)
         let mut events: Vec<BatsimEvent> = vec![];
+        let mut all_allocations: Vec<Rc<Allocation>> = vec![];
 
+        // In the first place we call for a normal schedule on each scheduler
         for scheduler in &mut self.schedulers {
             let (allocations, rejeted) = scheduler.schedule_jobs(self.time);
             match allocations {
                 Some(allocs) => {
-                    let ready_allocations: Vec<Rc<Allocation>> = allocs
+                    let (ready_allocations, delayed_allocations): (Vec<Rc<Allocation>>, Vec<Rc<Allocation>>) = allocs
                         .into_iter()
-                        .filter_map(|alloc| if alloc.nb_of_res_to_complete() == 0 {
-                                        return Some(alloc.clone());
-                                    } else {
-                                        return None;
-                                    })
-                        .collect();
+                        .partition(|alloc| alloc.nb_of_res_to_complete() == 0);
 
-                    for ready_allocation in &ready_allocations {
-                        scheduler.job_launched(ready_allocation.job.id.clone());
-                    }
-                    events.extend(allocations_to_batsim_events(self.time, ready_allocations));
+                    println!("no delayed: {}", delayed_allocations.len());
+                    delayed_allocations.iter().inspect(|w| println!("{:?}", w));
+                    all_allocations.extend(ready_allocations);
                 }
                 _ => {}
             }
         }
-        trace!("Respond to batsim at: {} with {} events", timestamp, events.len());
+        // We notify every scheduler wereas we launch one
+        // of the jobs. Each scheduler will update the sheduled lauching time of the next job in
+        // the queue.
+        let time: f64 = self.time;
+        for ready_allocation in &all_allocations {
+            self.schedulers_for(ready_allocation.job.clone(),
+                                &|scheduler| {
+                                     scheduler.job_launched(time, ready_allocation.job.id.clone())
+                                 });
+        }
+
+        events.extend(allocations_to_batsim_events(self.time, all_allocations));
+        trace!("Respond to batsim at: {} with {} events",
+               timestamp,
+               events.len());
         Some(events)
     }
 
     fn on_message_received_begin(&mut self, timestamp: &f64) -> Option<Vec<BatsimEvent>> {
         trace!("Received new batsim message at {}", timestamp);
         None
+    }
+}
+
+impl MetaScheduler {
+    fn schedulers_for(&mut self, job: Rc<Job>, func: &Fn(&mut SubScheduler)) {
+        if job.res <= self.greater_grp_size as i32 {
+            let grp_idx = get_job_grp(&job);
+            func(&mut self.schedulers.get_mut(grp_idx).unwrap());
+        } else {
+            let nm_res = job.res;
+            // If the jobs do not fit into any of the sub schedulers
+            // we send it to schedulers till we have enought cores.
+            let mut iter_sched = self.schedulers.iter_mut().enumerate().rev();
+            let mut sched = iter_sched.next();
+            let mut cores_remaining = job.res;
+
+            while cores_remaining > 0 {
+                match sched {
+                    Some(mut scheduler) => {
+                        func(&mut scheduler.1);
+
+                        cores_remaining -= 2i32.pow(scheduler.0 as u32);
+                    }
+                    None => break,
+                }
+                sched = iter_sched.next();
+            }
+        }
     }
 }
 
