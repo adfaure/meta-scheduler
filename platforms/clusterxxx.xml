@@ -3,13 +3,12 @@
 <platform version="4">
 
 <AS id="AS0" routing="Full">
-    <cluster id="my_cluster_1" prefix="a" suffix="" radical="0-14"
+    <cluster id="my_cluster_1" prefix="a" suffix="" radical="0-15"
         speed="1Gf" bw="125MBps" lat="50us" bb_bw="2.25GBps"
         bb_lat="500us" />
 
     <cluster id="my_cluster_2" prefix="master_host" suffix="" radical="0-0"
         speed="1Gf" bw="125MBps" lat="50us" bb_bw="2.25GBps"
-        {"id":1, "subtime":0, "walltime": 100,  "res": 2, "profile": "5"},
         bb_lat="500us" />
 
     <link id="backbone" bandwidth="1.25GBps" latency="500us" />

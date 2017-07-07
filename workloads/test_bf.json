@@ -8,11 +8,15 @@
     "jobs": [
         {"id":1, "subtime":0, "walltime": 100,  "res": 2, "profile": "5"},
         {"id":2, "subtime":0.1, "walltime": 10, "res": 8, "profile": "1"},
-        {"id":3, "subtime":0.1, "walltime": 50, "res": 4, "profile": "5"},
-        {"id":4, "subtime":0.2, "walltime": 10, "res": 1, "profile": "1"},
-        {"id":10, "subtime":0.2, "walltime": 10, "res": 1, "profile": "1"},
-        {"id":11, "subtime":0.1, "walltime": 10, "res": 15, "profile": "1"},
-        {"id":12, "subtime":0.3, "walltime": 10, "res": 15, "profile": "1"}
+        {"id":3, "subtime":0.4, "walltime": 1, "res": 8, "profile": "1"},
+        {"id":5, "subtime":0.4, "walltime": 1, "res": 1, "profile": "1"},
+        {"id":12, "subtime":0.3, "walltime": 10, "res": 15, "profile": "1"},
+
+        {"id":100, "subtime":1, "walltime": 100,  "res": 2, "profile": "5"},
+        {"id":200, "subtime":1.1, "walltime": 10, "res": 8, "profile": "1"},
+        {"id":300, "subtime":1.4, "walltime": 1, "res": 9, "profile": "1"},
+        {"id":599900, "subtime":1.4, "walltime": 1, "res": 1, "profile": "1"},
+        {"id":1200, "subtime":1, "walltime": 10, "res": 15, "profile": "1"}
     ],
 
     "profiles": {

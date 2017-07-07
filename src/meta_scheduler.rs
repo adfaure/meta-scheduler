@@ -94,7 +94,7 @@ impl Scheduler for MetaScheduler {
 
         info!("We use only {} over {}",
               nb_machines_used,
-              self.nb_resources - 1);
+              self.nb_resources);
 
         self.nb_dangling_resources = (self.nb_resources - nb_machines_used) as i32;
         if self.nb_dangling_resources <= 0 {
@@ -177,6 +177,8 @@ impl Scheduler for MetaScheduler {
         let mut events: Vec<BatsimEvent> = vec![];
         let mut all_allocations: Vec<Rc<Allocation>> = vec![];
 
+        let mut unready_jobs: Vec<Rc<Allocation>> = vec![];
+
         // In the first place we call for a normal schedule on each scheduler
         for scheduler in &mut self.schedulers {
             let (allocations, rejeted) = scheduler.schedule_jobs(self.time);
@@ -186,16 +188,15 @@ impl Scheduler for MetaScheduler {
                         .into_iter()
                         .partition(|alloc| alloc.nb_of_res_to_complete() == 0);
 
-                    println!("no delayed: {}", delayed_allocations.len());
-                    delayed_allocations.iter().inspect(|w| println!("{:?}", w));
                     all_allocations.extend(ready_allocations);
+                    unready_jobs.extend(delayed_allocations);
                 }
                 _ => {}
             }
         }
+
         // We notify every scheduler wereas we launch one
-        // of the jobs. Each scheduler will update the sheduled lauching time of the next job in
-        // the queue.
+        // of the jobs.
         let time: f64 = self.time;
         for ready_allocation in &all_allocations {
             self.schedulers_for(ready_allocation.job.clone(),
@@ -204,6 +205,57 @@ impl Scheduler for MetaScheduler {
                                  });
         }
 
+        // We notify every scheduler wereas we delay  one
+        // of the jobs. Each scheduler will update the sheduled lauching time of the next job in
+        // the queue.
+        let time: f64 = self.time;
+        for delayed_allocation in &unready_jobs {
+            self.schedulers_for(delayed_allocation.job.clone(),
+                                &|scheduler| {
+                                     scheduler.calculate_expected_release_date(time, delayed_allocation.clone())
+                                 });
+        }
+
+        let mut backfilled_allocations: Vec<Rc<Allocation>> = vec![];
+        // Finally we call all the schedulers back one more time.
+        // It allow to backfill jobs for example
+        for scheduler in &mut self.schedulers {
+            let allocations = scheduler.after_schedule(self.time);
+            match allocations {
+                Some(allocs) => {
+                    let (ready_allocations, delayed_allocations): (Vec<Rc<Allocation>>, Vec<Rc<Allocation>>) = allocs
+                        .into_iter()
+                        .partition(|alloc| alloc.nb_of_res_to_complete() == 0);
+
+                    backfilled_allocations.extend(ready_allocations);
+                    unready_jobs.extend(delayed_allocations);
+                    assert!(unready_jobs.len() == 0);
+                }
+                _ => {}
+            }
+        }
+
+        // We notify every scheduler wereas we launch one
+        // of the backfilled jobs.
+        let time: f64 = self.time;
+        for ready_allocation in &backfilled_allocations {
+            self.schedulers_for(ready_allocation.job.clone(),
+                                &|scheduler| {
+                                     scheduler.job_launched(time, ready_allocation.job.id.clone())
+                                 });
+        }
+
+        // We notify every scheduler wereas we launch one
+        // of the backfilled jobs.
+        let time: f64 = self.time;
+        for ready_allocation in &backfilled_allocations {
+            self.schedulers_for(ready_allocation.job.clone(),
+                                &|scheduler| {
+                                     scheduler.job_launched(time, ready_allocation.job.id.clone())
+                                 });
+        }
+
+        all_allocations.extend(backfilled_allocations);
         events.extend(allocations_to_batsim_events(self.time, all_allocations));
         trace!("Respond to batsim at: {} with {} events",
                timestamp,
