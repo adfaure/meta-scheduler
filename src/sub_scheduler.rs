@@ -10,7 +10,7 @@ pub struct SubScheduler {
     /// Current free resources
     resources: Interval,
     /// FCFS queue of job
-    jobs_queue: VecDeque<Rc<Allocation>>,
+    jobs_queue: Vec<Rc<Allocation>>,
     /// Jobs that are currently running
     jobs_running: Vec<Rc<Allocation>>,
     /// Jobs that are currently waiting to be lauched by the
@@ -22,7 +22,7 @@ impl SubScheduler {
     pub fn new(resources: Interval) -> SubScheduler {
         SubScheduler {
             resources: resources,
-            jobs_queue: VecDeque::new(),
+            jobs_queue: vec![],
             jobs_running: vec![],
             jobs_waiting: vec![],
         }
@@ -34,30 +34,11 @@ impl SubScheduler {
         // If no jobs are yet running on this scheduler
         // we will allocate the next job.
         if self.jobs_waiting.len() == 0 && self.jobs_running.len() == 0 {
-            let interval;
-            match self.jobs_queue.pop_front() {
+            match self.jobs_queue.pop() {
                 Some(mut next_allocation) => {
-                    if next_allocation.job.res <= self.resources.range_size() as i32 {
-                        // In this case the jobs can be lauched entirely into
-                        // the ressources of this scheduler.
-                        let nb_resources = cmp::min(self.resources.range_size(),
-                                                    next_allocation.job.res as u32);
-                        interval = Interval::new(self.resources.get_inf(),
-                                                 self.resources.get_inf() + nb_resources - 1);
-                    } else {
-                        let ressources_to_complete = cmp::min(self.resources.range_size(),
-                                                              next_allocation
-                                                                  .nb_of_res_to_complete());
-                        interval = Interval::new(self.resources.get_inf(),
-                                                 self.resources.get_inf() + ressources_to_complete -
-                                                 1);
-                    }
-                    // We upate the allocation with the resources
-                    // allocated by the scheduler
-                    next_allocation.add_resources(interval.to_interval_set());
-
-                    self.jobs_waiting.push(next_allocation.clone());
-                    return (Some(vec![next_allocation.clone()]), None);
+                    let alloc = self.allocate_job(next_allocation);
+                    self.jobs_waiting.push(alloc.clone());
+                    return (Some(vec![alloc.clone()]), None);
                 }
                 None => {
                     // There is no jobs waiting
@@ -67,10 +48,10 @@ impl SubScheduler {
         (None, None)
     }
 
+    /// This function will return all jobs that are elligible for the backfilling
+    /// policy `EASY`.
+    pub fn easy_backfill(&mut self, time: f64) -> Option<Vec<Rc<Allocation>>> {
 
-    pub fn after_schedule(&mut self, time: f64) -> Option<Vec<Rc<Allocation>>> {
-
-        //
         let mut bf_position: Option<usize> = None;
 
         // If no jobs are running yet on this group, but one job is waiting
@@ -79,47 +60,22 @@ impl SubScheduler {
             match self.jobs_waiting.get(0) {
                 Some(waiting_alloc) => {
                     let free_running_time = waiting_alloc.sheduled_lauched_time.get() - time;
-                    match self.jobs_queue
-                              .iter()
-                              .enumerate()
-                              .find(|alloc| alloc.1.job.walltime <= free_running_time) {
-                        Some((pos, job)) => {
-                            bf_position = Some(pos);
-                        }
-                        None => {}
-                    }
+
+                    return Some(self.jobs_queue
+                                    .iter()
+                                    .enumerate()
+                                    .filter_map(|alloc| if alloc.1.job.walltime <=
+                                                           free_running_time {
+                                                    return Some(alloc.1.clone());
+                                                } else {
+                                                    return None;
+                                                })
+                                    .collect());
                 }
-                None => {}
+                None => return None,
             }
         }
-
-        //TODO This code is the same as the code from the schdeul functions
-        match bf_position {
-            Some(pos) => {
-                let alloc = self.jobs_queue.remove(pos).unwrap().clone();
-                let interval;
-
-                if alloc.job.res <= self.resources.range_size() as i32 {
-                    // In this case the jobs can be lauched entirely into
-                    // the ressources of this scheduler.
-                    let nb_resources = cmp::min(self.resources.range_size(),
-                                                alloc.job.res as u32);
-                    interval = Interval::new(self.resources.get_inf(),
-                                             self.resources.get_inf() + nb_resources - 1);
-                } else {
-                    //panic!("We backfill a huge job, are you sure?");
-                    let ressources_to_complete = cmp::min(self.resources.range_size(),
-                                                          alloc.nb_of_res_to_complete());
-                    interval = Interval::new(self.resources.get_inf(),
-                                             self.resources.get_inf() + ressources_to_complete - 1);
-                }
-                alloc.add_resources(interval.to_interval_set());
-                trace!("We backfill {:?}", alloc);
-                self.jobs_waiting.push(alloc.clone());
-                Some(vec![alloc.clone()])
-            },
-            _ => None,
-        }
+        None
     }
 
     /// Ask the scheduler to update/set the scheduled release date
@@ -141,7 +97,7 @@ impl SubScheduler {
     /// several schedulers.
     pub fn add_job(&mut self, allocation: Rc<Allocation>) {
         trace!("Jobs has been added: {:?}", allocation);
-        self.jobs_queue.push_back(allocation.clone());
+        self.jobs_queue.push(allocation.clone());
     }
 
     /// Notify the sub scheduler that the job with id `finished_job`
@@ -158,7 +114,22 @@ impl SubScheduler {
         self.jobs_running.retain(|x| killed_job != x.job.id);
     }
 
-    /// Notify the sub scheduler that a job has been lauched and thus voila
+    /// notify the sub scheduler that a job has been lauched from the waiting queue
+    /// This is typically a situation of backfilling.
+    pub fn job_backfilled(&mut self, time: f64, job: String) {
+        // retrieve and remove the job from the waiting queue.
+        trace!("Jobs has been backfilled: {}", job);
+        let idx = self.jobs_queue
+            .iter()
+            .position(|x| job == x.job.id)
+            .unwrap();
+
+        //        self.jobs_queue.sort_by(|a, b| a.job.subtime.partial_cmp(&b.job.subtime).unwrap());
+        let alloc = self.jobs_queue.remove(idx);
+        self.jobs_running.push(alloc);
+    }
+
+    /// notify the sub scheduler that a job has been lauched and thus voila
     pub fn job_launched(&mut self, time: f64, job: String) {
         // retrieve and remove the job from the waiting queue.
         trace!("Jobs has been launched: {}", job);
@@ -167,9 +138,30 @@ impl SubScheduler {
             .position(|x| job == x.job.id)
             .unwrap();
 
+        //        self.jobs_queue.sort_by(|a, b| a.job.subtime.partial_cmp(&b.job.subtime).unwrap());
         let alloc = self.jobs_waiting.remove(idx);
-
-        let ends_at = time + alloc.job.walltime;
         self.jobs_running.push(alloc);
+    }
+
+    /// Fil the resources for the given allocation
+    fn allocate_job(&self, allocation: Rc<Allocation>) -> Rc<Allocation> {
+        let interval;
+        if allocation.job.res <= self.resources.range_size() as i32 {
+            // In this case the jobs can be lauched entirely into
+            // the ressources of this scheduler.
+            let nb_resources = cmp::min(self.resources.range_size(), allocation.job.res as u32);
+            interval = Interval::new(self.resources.get_inf(),
+                                     self.resources.get_inf() + nb_resources - 1);
+        } else {
+            let ressources_to_complete = cmp::min(self.resources.range_size(),
+                                                  allocation.nb_of_res_to_complete());
+            interval = Interval::new(self.resources.get_inf(),
+                                     self.resources.get_inf() + ressources_to_complete - 1);
+        }
+        // We upate the allocation with the resources
+        // allocated by the scheduler
+        allocation.add_resources(interval.to_interval_set());
+
+        allocation.clone()
     }
 }

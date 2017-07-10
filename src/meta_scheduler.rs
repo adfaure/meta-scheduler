@@ -217,10 +217,11 @@ impl Scheduler for MetaScheduler {
         }
 
         let mut backfilled_allocations: Vec<Rc<Allocation>> = vec![];
+        let mut delayed_backfilled_allocations: Vec<Rc<Allocation>> = vec![];
         // Finally we call all the schedulers back one more time.
-        // It allow to backfill jobs for example
+        // It allows to backfill jobs for example
         for scheduler in &mut self.schedulers {
-            let allocations = scheduler.after_schedule(self.time);
+            let allocations = scheduler.easy_backfill(self.time);
             match allocations {
                 Some(allocs) => {
                     let (ready_allocations, delayed_allocations): (Vec<Rc<Allocation>>, Vec<Rc<Allocation>>) = allocs
@@ -228,8 +229,8 @@ impl Scheduler for MetaScheduler {
                         .partition(|alloc| alloc.nb_of_res_to_complete() == 0);
 
                     backfilled_allocations.extend(ready_allocations);
-                    unready_jobs.extend(delayed_allocations);
-                    assert!(unready_jobs.len() == 0);
+                    delayed_backfilled_allocations.extend(delayed_allocations);
+                    //assert!(unready_jobs.len() == 0);
                 }
                 _ => {}
             }
@@ -241,7 +242,7 @@ impl Scheduler for MetaScheduler {
         for ready_allocation in &backfilled_allocations {
             self.schedulers_for(ready_allocation.job.clone(),
                                 &|scheduler| {
-                                     scheduler.job_launched(time, ready_allocation.job.id.clone())
+                                     scheduler.job_backfilled(time, ready_allocation.job.id.clone())
                                  });
         }
 
