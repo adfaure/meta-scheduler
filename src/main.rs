@@ -5,7 +5,9 @@ extern crate interval_set;
 extern crate batsim;
 #[macro_use]
 extern crate serde_json;
+extern crate uuid;
 
+use uuid::Uuid;
 mod common;
 mod meta_scheduler;
 mod sub_scheduler;

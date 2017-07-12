@@ -7,7 +7,8 @@ use common::Allocation;
 use std::str::FromStr;
 use std::cell::Cell;
 use std::rc::Rc;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use uuid::Uuid;
 
 #[derive(Debug)]
 pub struct RejectedJob {
@@ -21,7 +22,8 @@ pub struct RejectedJob {
 pub struct MetaScheduler {
     nb_resources: u32,
     time: f64,
-    schedulers: Vec<SubScheduler>,
+    schedulers: Vec<Uuid>,
+    schedulers_map: HashMap<Uuid, SubScheduler>,
     config: serde_json::Value,
     max_job_size: usize,
     greater_grp_size: usize,
@@ -29,7 +31,7 @@ pub struct MetaScheduler {
     nb_dangling_resources: i32,
 
     profiles: HashMap<String, Profile>,
-    jobs: HashMap<String, Rc<Job>>,
+    jobs: HashMap<String, Rc<Allocation>>,
     rejected_jobs: HashMap<String, Rc<RejectedJob>>,
 }
 
@@ -39,6 +41,7 @@ impl MetaScheduler {
             nb_resources: 0,
             time: 0f64,
             schedulers: vec![],
+            schedulers_map: HashMap::new(),
             config: json!(null),
             max_job_size: 0,
             greater_grp_size: 0,
@@ -66,12 +69,15 @@ impl Scheduler for MetaScheduler {
         self.max_job_size = (2 as u32).pow(nb_grps) as usize - 1;
 
         //The size of the greates group of resources.
-        self.greater_grp_size = (2 as u32).pow(nb_grps - 1) as usize - 1;
+        self.greater_grp_size = (2 as u32).pow(nb_grps - 1) as usize;
 
         info!("We can construct {} groups with {} resources",
               nb_grps,
               nb_resources);
         info!("The max job size accepted is {}", self.max_job_size);
+        info!("The biggest group has  {} resources", self.greater_grp_size
+              );
+
 
         self.config = config;
         // We get the threshold from the configuration
@@ -83,13 +89,20 @@ impl Scheduler for MetaScheduler {
 
         let mut nb_machines_used = 0;
         for idx in 0..nb_grps {
-            let interval = Interval::new(2_u32.pow(idx) as u32 - 1, (2_u32.pow(idx + 1) - 2) as u32);
+            let interval = Interval::new(2_u32.pow(idx) as u32 - 1,
+                                         (2_u32.pow(idx + 1) - 2) as u32);
             let mut scheduler: SubScheduler = SubScheduler::new(interval.clone());
 
             nb_machines_used += interval.range_size();
-            info!("Groupe(n={}) uses {} nodes: {:?}", idx, interval.range_size(), interval);
+            info!("Groupe(n={}) uses {} nodes: {:?}",
+                  idx,
+                  interval.range_size(),
+                  interval);
 
-            self.schedulers.insert(idx as usize, scheduler);
+            self.schedulers
+                .insert(idx as usize, scheduler.uuid.clone());
+            self.schedulers_map
+                .insert(scheduler.uuid.clone(), scheduler);
         }
 
         info!("We use only {} over {}",
@@ -139,11 +152,13 @@ impl Scheduler for MetaScheduler {
                 trace!("Get a new job(={:?}) with size {}", job, job.res);
                 let job_rc = Rc::new(job);
 
-                self.jobs.insert(job_rc.id.clone(), job_rc.clone());
 
                 let shared_allocation = Rc::new(Allocation::new(job_rc.clone()));
-                self.schedulers_for(job_rc.clone(),
-                                    &|scheduler| scheduler.add_job(shared_allocation.clone()));
+                self.jobs
+                    .insert(job_rc.id.clone(), shared_allocation.clone());
+                self.register_schedulers(shared_allocation.clone());
+                self.schedulers_for(shared_allocation.clone(),
+                                    &mut |scheduler| scheduler.add_job(shared_allocation.clone()));
             }
         }
         None
@@ -151,15 +166,15 @@ impl Scheduler for MetaScheduler {
 
     fn on_job_completed(&mut self, _: &f64, job_id: String, _: String) -> Option<Vec<BatsimEvent>> {
         trace!("Job completed: {}", job_id);
+        // Finished job is an `Allocation`
         let finished_job = self.jobs
             .get(&job_id)
             .ok_or("No job registered with this id")
             .unwrap()
             .clone();
 
-
         self.schedulers_for(finished_job.clone(),
-                            &|scheduler| scheduler.job_finished(finished_job.id.clone()));
+                            &mut |scheduler| scheduler.job_finished(finished_job.job.id.clone()));
 
         None
     }
@@ -177,80 +192,13 @@ impl Scheduler for MetaScheduler {
         let mut events: Vec<BatsimEvent> = vec![];
         let mut all_allocations: Vec<Rc<Allocation>> = vec![];
 
-        let mut unready_jobs: Vec<Rc<Allocation>> = vec![];
+        all_allocations.extend(self.schedule_jobs());
 
-        // In the first place we call for a normal schedule on each scheduler
-        for scheduler in &mut self.schedulers {
-            let (allocations, rejeted) = scheduler.schedule_jobs(self.time);
-            match allocations {
-                Some(allocs) => {
-                    let (ready_allocations, delayed_allocations): (Vec<Rc<Allocation>>, Vec<Rc<Allocation>>) = allocs
-                        .into_iter()
-                        .partition(|alloc| alloc.nb_of_res_to_complete() == 0);
-
-                    all_allocations.extend(ready_allocations);
-                    unready_jobs.extend(delayed_allocations);
-                }
-                _ => {}
-            }
-        }
-
-        // We notify every scheduler wereas we launch one
-        // of the jobs.
-        let time: f64 = self.time;
-        for ready_allocation in &all_allocations {
-            self.schedulers_for(ready_allocation.job.clone(),
-                                &|scheduler| {
-                                     scheduler.job_launched(time, ready_allocation.job.id.clone())
-                                 });
-        }
-
-        // We notify every scheduler wereas we delay  one
-        // of the jobs. Each scheduler will update the sheduled lauching time of the next job in
-        // the queue.
-        let time: f64 = self.time;
-        for delayed_allocation in &unready_jobs {
-            self.schedulers_for(delayed_allocation.job.clone(),
-                                &|scheduler| {
-                                     scheduler.calculate_expected_release_date(time, delayed_allocation.clone())
-                                 });
-        }
-
-        let mut backfilled_allocations: Vec<Rc<Allocation>> = vec![];
-        let mut delayed_backfilled_allocations: Vec<Rc<Allocation>> = vec![];
-        // Finally we call all the schedulers back one more time.
-        // It allows to backfill jobs for example
-        for scheduler in &mut self.schedulers {
-            let allocations = scheduler.easy_backfill(self.time);
-            match allocations {
-                Some(allocs) => {
-                    let (ready_allocations, delayed_allocations): (Vec<Rc<Allocation>>, Vec<Rc<Allocation>>) = allocs
-                        .into_iter()
-                        .partition(|alloc| alloc.nb_of_res_to_complete() == 0);
-
-                    backfilled_allocations.extend(ready_allocations);
-                    delayed_backfilled_allocations.extend(delayed_allocations);
-                    //assert!(unready_jobs.len() == 0);
-                }
-                _ => {}
-            }
-        }
-
-        // We notify every scheduler wereas we launch one
-        // of the backfilled jobs.
-        let time: f64 = self.time;
-        for ready_allocation in &backfilled_allocations {
-            self.schedulers_for(ready_allocation.job.clone(),
-                                &|scheduler| {
-                                     scheduler.job_backfilled(time, ready_allocation.job.id.clone())
-                                 });
-        }
-
-        all_allocations.extend(backfilled_allocations);
         events.extend(allocations_to_batsim_events(self.time, all_allocations));
         trace!("Respond to batsim at: {} with {} events",
                timestamp,
                events.len());
+
         Some(events)
     }
 
@@ -261,10 +209,59 @@ impl Scheduler for MetaScheduler {
 }
 
 impl MetaScheduler {
-    fn schedulers_for(&mut self, job: Rc<Job>, func: &Fn(&mut SubScheduler)) {
+    fn schedule_jobs(&mut self) -> Vec<Rc<Allocation>> {
+        let mut all_allocations: Vec<Rc<Allocation>> = vec![];
+
+        // In the first place we call for a normal schedule on each scheduler
+        for scheduler_id in &self.schedulers {
+            let mut scheduler = self.schedulers_map
+                .get_mut(scheduler_id)
+                .expect("No scheduler for the given uuid");
+
+            let (allocations, rejected) = scheduler.schedule_jobs(self.time);
+            match allocations {
+                Some(allocs) => {
+                    let (ready_allocations, delayed_allocations): (Vec<Rc<Allocation>>, Vec<Rc<Allocation>>) = allocs
+                        .into_iter()
+                        .partition(|alloc| alloc.nb_of_res_to_complete() == 0);
+
+                    all_allocations.extend(ready_allocations);
+                }
+                _ => {}
+            }
+        }
+
+        // We notify every scheduler wereas we launch one
+        // of the jobs.
+        let time: f64 = self.time;
+        for ready_allocation in &all_allocations {
+            self.schedulers_for(ready_allocation.clone(),
+                                &mut |scheduler| {
+                                         scheduler.job_launched(time,
+                                                                ready_allocation.job.id.clone())
+                                     });
+        }
+
+        all_allocations
+    }
+
+    fn schedulers_for(&mut self, allocation: Rc<Allocation>, func: &mut FnMut(&mut SubScheduler)) {
+        for scheduler_id in &mut allocation.running_groups.borrow().iter() {
+            let scheduler = &mut self.schedulers_map.get_mut(&scheduler_id).unwrap();
+            func(scheduler);
+        }
+    }
+
+    fn register_schedulers(&mut self, allocation: Rc<Allocation>) {
+        let job = allocation.job.clone();
+
         if job.res <= self.greater_grp_size as i32 {
             let grp_idx = get_job_grp(&job);
-            func(&mut self.schedulers.get_mut(grp_idx).unwrap());
+            let uuid = self.schedulers.get(grp_idx).unwrap();
+            let scheduler = self.schedulers_map
+                .get_mut(&uuid)
+                .expect("This is a bug :)");
+            scheduler.register_to_allocation(allocation.clone());
         } else {
             let nm_res = job.res;
             // If the jobs do not fit into any of the sub schedulers
@@ -273,12 +270,16 @@ impl MetaScheduler {
             let mut sched = iter_sched.next();
             let mut cores_remaining = job.res;
 
+            info!("job res: {}", allocation.job.res);
             while cores_remaining > 0 {
                 match sched {
-                    Some(mut scheduler) => {
-                        func(&mut scheduler.1);
+                    Some(mut idx_scheduler) => {
+                        let scheduler = self.schedulers_map
+                            .get_mut(idx_scheduler.1)
+                            .expect("This is a bug :0");
 
-                        cores_remaining -= 2i32.pow(scheduler.0 as u32);
+                        allocation.add_group(scheduler.uuid.clone());
+                        cores_remaining -= 2i32.pow(idx_scheduler.0 as u32);
                     }
                     None => break,
                 }
@@ -293,7 +294,6 @@ fn get_job_grp(job: &Job) -> usize {
 }
 
 fn allocations_to_batsim_events(now: f64, allocation: Vec<Rc<Allocation>>) -> Vec<BatsimEvent> {
-
     allocation
         .into_iter()
         .filter_map(|alloc| {
