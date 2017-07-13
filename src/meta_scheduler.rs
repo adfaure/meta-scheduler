@@ -152,7 +152,6 @@ impl Scheduler for MetaScheduler {
                 trace!("Get a new job(={:?}) with size {}", job, job.res);
                 let job_rc = Rc::new(job);
 
-
                 let shared_allocation = Rc::new(Allocation::new(job_rc.clone()));
                 self.jobs
                     .insert(job_rc.id.clone(), shared_allocation.clone());
@@ -192,6 +191,7 @@ impl Scheduler for MetaScheduler {
         let mut events: Vec<BatsimEvent> = vec![];
         let mut all_allocations: Vec<Rc<Allocation>> = vec![];
 
+        //We call a standar scheduler on each sub groups
         all_allocations.extend(self.schedule_jobs());
 
         events.extend(allocations_to_batsim_events(self.time, all_allocations));
@@ -209,8 +209,13 @@ impl Scheduler for MetaScheduler {
 }
 
 impl MetaScheduler {
+    fn easy_backfilling(&mut self) -> Vec<Rc<Allocation>> {
+        vec![]
+    }
+
     fn schedule_jobs(&mut self) -> Vec<Rc<Allocation>> {
-        let mut all_allocations: Vec<Rc<Allocation>> = vec![];
+        let mut all_allocations: HashSet<Rc<Allocation>> = HashSet::new();
+        let mut all_delayed_allocations: HashSet<Rc<Allocation>> = HashSet::new();
 
         // In the first place we call for a normal schedule on each scheduler
         for scheduler_id in &self.schedulers {
@@ -221,20 +226,28 @@ impl MetaScheduler {
             let (allocations, rejected) = scheduler.schedule_jobs(self.time);
             match allocations {
                 Some(allocs) => {
-                    let (ready_allocations, delayed_allocations): (Vec<Rc<Allocation>>, Vec<Rc<Allocation>>) = allocs
-                        .into_iter()
-                        .partition(|alloc| alloc.nb_of_res_to_complete() == 0);
-
-                    all_allocations.extend(ready_allocations);
+                    all_allocations.extend(allocs);
                 }
                 _ => {}
             }
         }
 
+        let (ready_allocations, delayed_allocations): (Vec<Rc<Allocation>>, Vec<Rc<Allocation>>) = all_allocations
+            .into_iter()
+            .partition(|alloc| alloc.nb_of_res_to_complete() == 0);
+
+        let time: f64 = self.time;
+        for delayed_allocation in &delayed_allocations {
+            self.schedulers_for(delayed_allocation.clone(),
+                                &mut |scheduler| {
+                                         scheduler.job_waiting(time,
+                                                                delayed_allocation.clone())
+                                     });
+        }
+
         // We notify every scheduler wereas we launch one
         // of the jobs.
-        let time: f64 = self.time;
-        for ready_allocation in &all_allocations {
+        for ready_allocation in &ready_allocations {
             self.schedulers_for(ready_allocation.clone(),
                                 &mut |scheduler| {
                                          scheduler.job_launched(time,
@@ -242,7 +255,7 @@ impl MetaScheduler {
                                      });
         }
 
-        all_allocations
+        ready_allocations.into_iter().collect()
     }
 
     fn schedulers_for(&mut self, allocation: Rc<Allocation>, func: &mut FnMut(&mut SubScheduler)) {

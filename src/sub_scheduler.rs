@@ -51,13 +51,26 @@ impl SubScheduler {
                 }
             }
         }
+
+        if self.jobs_running.len() == 0 {
+            match self.jobs_waiting.get(0) {
+                Some(job) => {
+                    let alloc = self.allocate_job(job.clone());
+                    return (Some(vec![alloc.clone()]), None);
+                },
+                None => {}
+            }
+        }
         (None,None)
     }
 
     /// Ask the scheduler to update/set the scheduled release date
     /// of the given allocation. The idea is to have a prediction of
     /// the future.
-    pub fn calculate_expected_release_date(&mut self, time: f64, allocation: Rc<Allocation>) {
+    pub fn job_waiting(&mut self, time: f64, allocation: Rc<Allocation>) {
+
+        self.job_revert_allocation(allocation.clone());
+
         let mut cummulative_time = time;
         for alloc in &self.jobs_queue {
             cummulative_time += alloc.job.walltime;

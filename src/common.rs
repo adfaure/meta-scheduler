@@ -4,6 +4,7 @@ use std::cell::Cell;
 use std::cell::RefCell;
 use std::rc::Rc;
 use uuid::Uuid;
+use std::hash::{Hash, Hasher};
 
 #[derive(Clone, Debug)]
 /// An allocation wrap a
@@ -19,6 +20,21 @@ pub struct Allocation {
     pub sheduled_lauched_time: Cell<f64>,
     pub running_groups: RefCell<Vec<Uuid>>
 }
+
+
+impl Hash for Allocation {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.job.id.hash(state);
+    }
+}
+
+impl PartialEq for Allocation {
+    fn eq(&self, other: &Allocation) -> bool {
+        self.job.id == other.job.id
+    }
+}
+
+impl Eq for Allocation {}
 
 impl Allocation {
     pub fn new(job: Rc<Job>) -> Allocation {
