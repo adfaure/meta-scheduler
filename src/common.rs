@@ -1,12 +1,13 @@
 use batsim::json_protocol::Job;
-use interval_set::IntervalSet;
+use interval_set::*;
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::rc::Rc;
 use uuid::Uuid;
 use std::hash::{Hash, Hasher};
+use std::fmt;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 /// An allocation wrap a
 /// job with data such as the ressources allocated
 /// and the time at which the jobs may starts.
@@ -21,6 +22,12 @@ pub struct Allocation {
     pub running_groups: RefCell<Vec<Uuid>>
 }
 
+impl fmt::Debug for Allocation {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "job: {}", self.job.id);
+        write!(f, "interval: {} - missing: {}", self.nodes.borrow().clone(), self.nb_of_res_to_complete())
+    }
+}
 
 impl Hash for Allocation {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -55,7 +62,6 @@ impl Allocation {
         // to be able to call `into_inner` and finally clone the interval
         let temp_interval: IntervalSet = self.nodes.clone().into_inner().clone();
         *self.nodes.borrow_mut() = temp_interval.difference(interval.clone());
-        trace!("Removed {:?} \t resources: {:?} \t Resources left {}", interval, self, self.nb_of_res_to_complete());
     }
 
     /// This function is in fact mutable because we take advantage
@@ -74,6 +80,10 @@ impl Allocation {
     pub fn add_group(&self, uuid: Uuid) {
         let mut hashset = self.running_groups.borrow_mut();
         hashset.push(uuid);
+    }
+
+    pub fn update_sheduled_launched_time(&self, time: f64) {
+        self.sheduled_lauched_time.set(time);
     }
 
     pub fn may_update_sheduled_lauched_time(&self, time: f64) {

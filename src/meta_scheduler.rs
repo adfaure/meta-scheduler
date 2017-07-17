@@ -75,8 +75,7 @@ impl Scheduler for MetaScheduler {
               nb_grps,
               nb_resources);
         info!("The max job size accepted is {}", self.max_job_size);
-        info!("The biggest group has  {} resources", self.greater_grp_size
-              );
+        info!("The biggest group has  {} resources", self.greater_grp_size);
 
 
         self.config = config;
@@ -173,7 +172,10 @@ impl Scheduler for MetaScheduler {
             .clone();
 
         self.schedulers_for(finished_job.clone(),
-                            &mut |scheduler| scheduler.job_finished(finished_job.job.id.clone()));
+                            &mut |scheduler| {
+                                     assert!(scheduler.is_busy());
+                                     scheduler.job_finished(finished_job.job.id.clone());
+                                 });
 
         None
     }
@@ -192,9 +194,21 @@ impl Scheduler for MetaScheduler {
         let mut all_allocations: Vec<Rc<Allocation>> = vec![];
 
         //We call a standar scheduler on each sub groups
-        all_allocations.extend(self.schedule_jobs());
+        let jobs = self.schedule_jobs();
+        let bf = self.easy_backfilling();
+
+        let mut size = jobs.len() + bf.len();
+        all_allocations.extend(jobs);
+        all_allocations.extend(bf);
+
+        assert!(all_allocations.len() == size);
+
+        for sch in self.schedulers_map.iter() {
+            trace!("{:?}", sch.1);
+        }
 
         events.extend(allocations_to_batsim_events(self.time, all_allocations));
+        assert!(events.len() == size);
         trace!("Respond to batsim at: {} with {} events",
                timestamp,
                events.len());
@@ -210,7 +224,31 @@ impl Scheduler for MetaScheduler {
 
 impl MetaScheduler {
     fn easy_backfilling(&mut self) -> Vec<Rc<Allocation>> {
-        vec![]
+        let mut all_allocations: HashSet<Rc<Allocation>> = HashSet::new();
+
+        for scheduler_id in &self.schedulers {
+            let mut scheduler = self.schedulers_map
+                .get_mut(scheduler_id)
+                .expect("No scheduler for the given uuid");
+
+            let mut allocations = scheduler.easy_back_filling(self.time);
+            // We arbitrary get one job (if there is one)
+            match allocations.pop() {
+                Some(alloc) => {
+                    all_allocations.insert(alloc);
+                }
+                _ => {}
+            }
+        }
+
+        let time: f64 = self.time;
+        for alloc in &all_allocations {
+            self.schedulers_for(alloc.clone(),
+                                &mut |scheduler| {
+                                         scheduler.job_backfilled(time, alloc.job.id.clone());
+                                     });
+        }
+        all_allocations.into_iter().collect()
     }
 
     fn schedule_jobs(&mut self) -> Vec<Rc<Allocation>> {
@@ -232,16 +270,20 @@ impl MetaScheduler {
             }
         }
 
-        let (ready_allocations, delayed_allocations): (Vec<Rc<Allocation>>, Vec<Rc<Allocation>>) = all_allocations
-            .into_iter()
-            .partition(|alloc| alloc.nb_of_res_to_complete() == 0);
+        let (ready_allocations, delayed_allocations): (Vec<Rc<Allocation>>,
+                                                       Vec<Rc<Allocation>>) =
+            all_allocations
+                .into_iter()
+                .partition(|alloc| alloc.nb_of_res_to_complete() == 0);
 
         let time: f64 = self.time;
         for delayed_allocation in &delayed_allocations {
+            delayed_allocation.update_sheduled_launched_time(time);
             self.schedulers_for(delayed_allocation.clone(),
                                 &mut |scheduler| {
-                                         scheduler.job_waiting(time,
-                                                                delayed_allocation.clone())
+                                         trace!("Revert allocation for job: {}",
+                                                delayed_allocation.job.id);
+                                         scheduler.job_waiting(time, delayed_allocation.clone())
                                      });
         }
 
@@ -254,7 +296,6 @@ impl MetaScheduler {
                                                                 ready_allocation.job.id.clone())
                                      });
         }
-
         ready_allocations.into_iter().collect()
     }
 
@@ -309,13 +350,8 @@ fn get_job_grp(job: &Job) -> usize {
 fn allocations_to_batsim_events(now: f64, allocation: Vec<Rc<Allocation>>) -> Vec<BatsimEvent> {
     allocation
         .into_iter()
-        .filter_map(|alloc| {
-                        if alloc.job.res as u32 <= alloc.nodes.borrow().size() {
-                            return Some(allocate_job_event(now,
-                                                           &*alloc.job,
-                                                           format!("{}", *alloc.nodes.borrow())));
-                        }
-                        None
-                    })
+        .map(|alloc| {
+                 return allocate_job_event(now, &*alloc.job, format!("{}", *alloc.nodes.borrow()));
+             })
         .collect()
 }
