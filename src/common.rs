@@ -24,7 +24,7 @@ pub struct Allocation {
 
 impl fmt::Debug for Allocation {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "job: {}", self.job.id);
+        write!(f, "job: {}\t", self.job.id);
         write!(f, "interval: {} - missing: {}", self.nodes.borrow().clone(), self.nb_of_res_to_complete())
     }
 }

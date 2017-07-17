@@ -25,11 +25,11 @@ impl fmt::Debug for SubScheduler {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self.jobs_running.first() {
             Some(job) => write!(f, "jobs running: {} \t", job.0.job.id),
-            None => write!(f, "Jobs running: None \t")
+            None => write!(f, "Jobs running: None \t"),
         };
         match self.jobs_waiting.first() {
             Some(job) => write!(f, "jobs waiting: {} \t", job.job.id),
-            None => write!(f, "Jobs waiting: None")
+            None => write!(f, "Jobs waiting: None"),
         };
         write!(f, "")
     }
@@ -76,6 +76,8 @@ impl SubScheduler {
 
     /// Function called at every iteration by the meta scheduler
     /// in order to get next job to schedule, and possibly a rejected job
+    /// In addition I think it is not possible to allocate a job
+    /// and reject one another job in the same time.
     pub fn schedule_jobs(&mut self, time: f64) -> (Option<Vec<Rc<Allocation>>>, Option<String>) {
         // If no jobs are yet running on this scheduler
         // we will allocate the next job.
@@ -89,7 +91,7 @@ impl SubScheduler {
                         assert!(self.jobs_waiting.len() == 1);
                         return (Some(vec![alloc.clone()]), None);
                     }
-                    None => {},
+                    None => {}
                 }
             } else {
                 match self.jobs_waiting.get(0) {
@@ -99,6 +101,11 @@ impl SubScheduler {
                     }
                     None => {}
                 }
+            }
+        } else {
+            if self.jobs_queue.len() > 10 {
+                trace!("We reject running job: {:?}", self.jobs_running.first().unwrap().0);
+                return (None, Some(self.jobs_running.first().unwrap().0.job.id.clone()))
             }
         }
         (None, None)
@@ -247,6 +254,7 @@ impl SubScheduler {
         trace!("{} jobs running \t {} jobs waiting \t {} jobs in queue",
                self.jobs_running.len(),
                self.jobs_waiting.len(),
+
                self.jobs_queue.len());
         !self.jobs_running.is_empty()
     }
