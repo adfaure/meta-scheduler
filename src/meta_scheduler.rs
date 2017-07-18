@@ -2,8 +2,9 @@ extern crate serde_json;
 
 use batsim::*;
 use interval_set::{Interval, IntervalSet, ToIntervalSet};
-use sub_scheduler::SubScheduler;
-use common::Allocation;
+use sub_scheduler::SubSchedulerRejection;
+use fcfs_scheduler::SubSchedulerFcfs;
+use common::*;
 use std::str::FromStr;
 use std::cell::Cell;
 use std::rc::Rc;
@@ -13,8 +14,8 @@ use uuid::Uuid;
 #[derive(Debug)]
 pub struct RejectedJob {
     job_id: String,
-    initial_job: Rc<Allocation>,
-    resub_job: Rc<Allocation>,
+    initial_job: Rc<Job>,
+    resub_job: Rc<Job>,
     ack_received: Cell<bool>,
     finished: Cell<bool>,
 }
@@ -23,7 +24,8 @@ pub struct MetaScheduler {
     nb_resources: u32,
     time: f64,
     schedulers: Vec<Uuid>,
-    schedulers_map: HashMap<Uuid, SubScheduler>,
+    rejection_scheduler: Uuid,
+    schedulers_map: HashMap<Uuid, Box<SubScheduler>>,
     config: serde_json::Value,
     max_job_size: usize,
     greater_grp_size: usize,
@@ -41,6 +43,7 @@ impl MetaScheduler {
             nb_resources: 0,
             time: 0f64,
             schedulers: vec![],
+            rejection_scheduler: Uuid::new_v4(),
             schedulers_map: HashMap::new(),
             config: json!(null),
             max_job_size: 0,
@@ -68,7 +71,7 @@ impl Scheduler for MetaScheduler {
         //The maximun job size accepted
         self.max_job_size = (2 as u32).pow(nb_grps) as usize - 1;
 
-        //The size of the greates group of resources.
+        //The size of the greatest group of resources.
         self.greater_grp_size = (2 as u32).pow(nb_grps - 1) as usize;
 
         info!("We can construct {} groups with {} resources",
@@ -90,7 +93,8 @@ impl Scheduler for MetaScheduler {
         for idx in 0..nb_grps {
             let interval = Interval::new(2_u32.pow(idx) as u32 - 1,
                                          (2_u32.pow(idx + 1) - 2) as u32);
-            let scheduler: SubScheduler = SubScheduler::new(interval.clone());
+            let scheduler: Box<SubScheduler> =
+                Box::new(SubSchedulerRejection::new(interval.clone()));
 
             nb_machines_used += interval.range_size();
             info!("Groupe(n={}) uses {} nodes: {:?}",
@@ -99,9 +103,9 @@ impl Scheduler for MetaScheduler {
                   interval);
 
             self.schedulers
-                .insert(idx as usize, scheduler.uuid.clone());
+                .insert(idx as usize, scheduler.get_uuid());
             self.schedulers_map
-                .insert(scheduler.uuid.clone(), scheduler);
+                .insert(scheduler.get_uuid(), scheduler);
         }
 
         info!("We use only {} over {}",
@@ -110,8 +114,14 @@ impl Scheduler for MetaScheduler {
 
         self.nb_dangling_resources = (self.nb_resources - nb_machines_used) as i32;
         if self.nb_dangling_resources <= 0 {
-            //panic!("No ressource available for rejection");
+            panic!("No ressource available for rejection");
         }
+
+        let scheduler: Box<SubScheduler> =
+            Box::new(SubSchedulerFcfs::new(Interval::new(nb_machines_used, self.nb_resources - 1)));
+        self.rejection_scheduler = scheduler.get_uuid();
+        self.schedulers_map
+            .insert(scheduler.get_uuid(), scheduler);
 
         // We tell batsim that it does not need to wait for us
         Some(vec![notify_event(*timestamp, String::from("submission_finished"))])
@@ -136,29 +146,16 @@ impl Scheduler for MetaScheduler {
             None => panic!("Did you forget to activate the profile forwarding ?"),
         }
 
-        // In waiting for a better idea, I use the job id to
-        // differentiate rejected jobs from casual jobs
-        let (w_id, j_id) = Job::split_id(&job.id);
-        match w_id.as_ref() {
-            "rej!" => {
-                // If a jobs has the wokload id "rej" w need to handle
-                // it separatly.
-                trace!("REJECTED job(={:?}) with size {}", job, job.res);
-                // Righ now we just panicking
-                panic!("Impossible to handle rejected job: {:?}", w_id);
-            }
-            _ => {
-                trace!("Get a new job(={:?}) with size {}", job, job.res);
-                let job_rc = Rc::new(job);
+        trace!("Get a new job(={:?}) with size {}", job, job.res);
+        let job_rc = Rc::new(job);
+        let shared_allocation = Rc::new(Allocation::new(job_rc.clone()));
 
-                let shared_allocation = Rc::new(Allocation::new(job_rc.clone()));
-                self.jobs
-                    .insert(job_rc.id.clone(), shared_allocation.clone());
-                self.register_schedulers(shared_allocation.clone());
-                self.schedulers_for(shared_allocation.clone(),
-                                    &mut |scheduler| scheduler.add_job(shared_allocation.clone()));
-            }
-        }
+        self.jobs
+            .insert(shared_allocation.job.id.clone(), shared_allocation.clone());
+
+        self.register_schedulers(shared_allocation.clone());
+        self.schedulers_for(shared_allocation.clone(),
+                            &mut |scheduler| scheduler.add_job(shared_allocation.clone()));
         None
     }
 
@@ -173,7 +170,6 @@ impl Scheduler for MetaScheduler {
 
         self.schedulers_for(finished_job.clone(),
                             &mut |scheduler| {
-                                     assert!(scheduler.is_busy());
                                      scheduler.job_finished(finished_job.job.id.clone());
                                  });
 
@@ -188,17 +184,23 @@ impl Scheduler for MetaScheduler {
         let mut events: Vec<BatsimEvent> = vec![];
         for job_id in jobs {
             trace!("Job {} has been succesfully killed", &job_id);
-
-            let rej_job = self.rejected_jobs
-                .get(&MetaScheduler::job_id_to_rej_id(&job_id))
-                .ok_or("Job killed unknown")
+            let killed_job = self.jobs
+                .get(&job_id)
+                .ok_or("No job registered with this id")
                 .unwrap()
                 .clone();
-            self.schedulers_for(rej_job.initial_job.clone(),
+
+            self.schedulers_for(killed_job.clone(),
                                 &mut |scheduler| scheduler.job_killed(job_id.clone()));
 
-            let profile: Option<&Profile> = self.profiles.get(&rej_job.initial_job.job.profile);
-            events.push(submit_job_event(*timestamp, &rej_job.resub_job.job, profile));
+            let profile: Option<&Profile> = self.profiles.get(&killed_job.job.profile);
+
+            let resub = self.rejected_jobs
+                .get(&MetaScheduler::job_id_to_rej_id(&job_id))
+                .unwrap();
+
+            trace!("Submit job {:?}", resub.resub_job);
+            events.push(submit_job_event(*timestamp, &resub.resub_job, profile));
         }
         Some(events)
     }
@@ -211,14 +213,11 @@ impl Scheduler for MetaScheduler {
         //We call a standar scheduler on each sub groups
         let (jobs, rejected) = self.schedule_jobs();
         let bf = self.easy_backfilling();
+        let rej = self.schedule_rejection_scheduler();
 
-        let mut size = jobs.len() + bf.len() + rejected.len();
         all_allocations.extend(jobs);
         all_allocations.extend(bf);
-
-        for sch in self.schedulers_map.iter() {
-            trace!("{:?}", sch.1);
-        }
+        all_allocations.extend(rej);
 
         events.extend(MetaScheduler::allocations_to_batsim_events(self.time, all_allocations));
 
@@ -272,6 +271,42 @@ impl MetaScheduler {
         all_allocations.into_iter().collect()
     }
 
+    fn schedule_rejection_scheduler(&mut self) -> Vec<Rc<Allocation>> {
+        let mut all_allocations: Vec<Rc<Allocation>> = vec![];
+        {
+            let mut scheduler = self.schedulers_map
+                .get_mut(&self.rejection_scheduler)
+                .expect("No scheduler for the given uuid");
+
+            let (allocations, rejected) = scheduler.schedule_jobs(self.time);
+            match allocations {
+                Some(allocs) => {
+                    all_allocations.extend(allocs);
+                }
+                _ => {}
+            }
+
+            match rejected {
+                Some(job_id) => panic!("This scheduler is not allowed to reject jobs"),
+                None => {}
+            }
+        }
+
+        // We notify every scheduler wereas we launch one
+        // of the jobs.
+        let time: f64 = self.time;
+        for ready_allocation in &all_allocations {
+            self.schedulers_for(ready_allocation.clone(),
+                                &mut |scheduler| {
+                                         scheduler.job_launched(time,
+                                                                ready_allocation.job.id.clone())
+                                     });
+        }
+
+
+        all_allocations
+    }
+
     fn schedule_jobs(&mut self) -> (Vec<Rc<Allocation>>, Vec<Rc<Allocation>>) {
         let mut all_allocations: HashSet<Rc<Allocation>> = HashSet::new();
         let mut all_delayed_allocations: HashSet<Rc<Allocation>> = HashSet::new();
@@ -299,6 +334,8 @@ impl MetaScheduler {
                 None => {}
             }
         }
+
+
 
         for reject in &rejected_jobs {
             trace!("Job {:?} has been rejected", reject);
@@ -337,45 +374,58 @@ impl MetaScheduler {
         (ready_allocations.into_iter().collect(), rejected_jobs)
     }
 
-    fn schedulers_for(&mut self, allocation: Rc<Allocation>, func: &mut FnMut(&mut SubScheduler)) {
+    fn schedulers_for(&mut self,
+                      allocation: Rc<Allocation>,
+                      func: &mut FnMut(&mut Box<SubScheduler>)) {
+
         for scheduler_id in &mut allocation.running_groups.borrow().iter() {
-            let scheduler = &mut self.schedulers_map.get_mut(&scheduler_id).unwrap();
+            let scheduler = self.schedulers_map.get_mut(&scheduler_id).unwrap();
             func(scheduler);
         }
     }
 
     fn register_schedulers(&mut self, allocation: Rc<Allocation>) {
         let job = allocation.job.clone();
+        let (w_id, j_id) = Job::split_id(&job.id);
 
-        if job.res <= self.greater_grp_size as i32 {
-            let grp_idx = MetaScheduler::get_job_grp(&job);
-            let uuid = self.schedulers.get(grp_idx).unwrap();
-            let scheduler = self.schedulers_map
-                .get_mut(&uuid)
-                .expect("This is a bug :)");
-            scheduler.register_to_allocation(allocation.clone());
-        } else {
-            let nm_res = job.res;
-            // If the jobs do not fit into any of the sub schedulers
-            // we send it to schedulers till we have enought cores.
-            let mut iter_sched = self.schedulers.iter_mut().enumerate().rev();
-            let mut sched = iter_sched.next();
-            let mut cores_remaining = job.res;
+        match w_id.as_ref() {
+            "rej!" => {
+                trace!("Rejected job, register rej sched {}",
+                       self.rejection_scheduler);
+                allocation.add_group(self.rejection_scheduler.clone());
+            }
+            _ => {
+                if job.res <= self.greater_grp_size as i32 {
+                    let grp_idx = MetaScheduler::get_job_grp(&job);
+                    let uuid = self.schedulers.get(grp_idx).unwrap();
+                    let scheduler = self.schedulers_map
+                        .get_mut(&uuid)
+                        .expect("This is a bug :)");
+                    scheduler.register_to_allocation(allocation.clone());
+                } else {
+                    let nm_res = job.res;
+                    // If the jobs do not fit into any of the sub schedulers
+                    // we send it to schedulers till we have enought cores.
+                    let mut iter_sched = self.schedulers.iter_mut().enumerate().rev();
+                    let mut sched = iter_sched.next();
+                    let mut cores_remaining = job.res;
 
-            info!("job res: {}", allocation.job.res);
-            while cores_remaining > 0 {
-                match sched {
-                    Some(mut idx_scheduler) => {
-                        let scheduler = self.schedulers_map
-                            .get_mut(idx_scheduler.1)
-                            .expect("This is a bug :0");
+                    trace!("job res: {}", allocation.job.res);
+                    while cores_remaining > 0 {
+                        match sched {
+                            Some(mut idx_scheduler) => {
+                                let scheduler = self.schedulers_map
+                                    .get_mut(idx_scheduler.1)
+                                    .expect("This is a bug :0");
 
-                        allocation.add_group(scheduler.uuid.clone());
-                        cores_remaining -= 2i32.pow(idx_scheduler.0 as u32);
+                                allocation.add_group(scheduler.get_uuid());
+                                cores_remaining -= 2i32.pow(idx_scheduler.0 as u32);
+                            }
+                            None => break,
+                        }
+                        sched = iter_sched.next();
                     }
-                    None => break,
                 }
-                sched = iter_sched.next();
             }
         }
     }
@@ -388,13 +438,14 @@ impl MetaScheduler {
     fn construct_rejected_job(allocation: Rc<Allocation>) -> RejectedJob {
         let (_, job_id) = Job::split_id(&allocation.job.id);
 
-        let mut resub_job = (*allocation.job).clone();
+        let mut resub_job: Job = (*allocation.job).clone();
         resub_job.id = format!("rej!{}", job_id);
 
+        trace!("{:?}", resub_job);
         RejectedJob {
             job_id: resub_job.id.clone(),
-            initial_job: allocation.clone(),
-            resub_job: Rc::new(Allocation::new(Rc::new(resub_job))),
+            initial_job: Rc::new((*allocation.job).clone()),
+            resub_job: Rc::new(resub_job.clone()),
             ack_received: Cell::new(false),
             finished: Cell::new(false),
         }

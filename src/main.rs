@@ -9,6 +9,7 @@ extern crate uuid;
 
 mod common;
 mod meta_scheduler;
+mod fcfs_scheduler;
 mod sub_scheduler;
 
 fn main() {

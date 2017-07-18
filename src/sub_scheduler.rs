@@ -1,4 +1,4 @@
-use common::Allocation;
+use common::{Allocation, SubScheduler};
 use std::collections::LinkedList;
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -7,7 +7,8 @@ use std::cmp;
 use uuid::Uuid;
 use std::fmt;
 
-pub struct SubScheduler {
+
+pub struct SubSchedulerRejection {
     /// Unique identifier for a sub scheduler
     pub uuid: Uuid,
     /// Current free resources
@@ -21,7 +22,19 @@ pub struct SubScheduler {
     jobs_waiting: Vec<Rc<Allocation>>,
 }
 
-impl fmt::Debug for SubScheduler {
+impl SubSchedulerRejection {
+    pub fn new(resources: Interval) -> Self {
+        SubSchedulerRejection {
+            uuid: Uuid::new_v4(),
+            resources: resources,
+            jobs_queue: vec![],
+            jobs_running: vec![],
+            jobs_waiting: vec![],
+        }
+    }
+}
+
+impl fmt::Debug for SubSchedulerRejection {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self.jobs_running.first() {
             Some(job) => write!(f, "jobs running: {} \t", job.0.job.id),
@@ -35,18 +48,8 @@ impl fmt::Debug for SubScheduler {
     }
 }
 
-impl SubScheduler {
-    pub fn new(resources: Interval) -> SubScheduler {
-        SubScheduler {
-            uuid: Uuid::new_v4(),
-            resources: resources,
-            jobs_queue: vec![],
-            jobs_running: vec![],
-            jobs_waiting: vec![],
-        }
-    }
-
-    pub fn easy_back_filling(&mut self, current_time: f64) -> Vec<Rc<Allocation>> {
+impl SubScheduler for SubSchedulerRejection {
+    fn easy_back_filling(&mut self, current_time: f64) -> Vec<Rc<Allocation>> {
         //If the group is already busy, we dont need to backfill
         if !self.jobs_running.is_empty() {
             return vec![];
@@ -78,7 +81,7 @@ impl SubScheduler {
     /// in order to get next job to schedule, and possibly a rejected job
     /// In addition I think it is not possible to allocate a job
     /// and reject one another job in the same time.
-    pub fn schedule_jobs(&mut self, time: f64) -> (Option<Vec<Rc<Allocation>>>, Option<String>) {
+    fn schedule_jobs(&mut self, time: f64) -> (Option<Vec<Rc<Allocation>>>, Option<String>) {
         // If no jobs are yet running on this scheduler
         // we will allocate the next job.
         if self.jobs_running.len() == 0 {
@@ -103,9 +106,10 @@ impl SubScheduler {
                 }
             }
         } else {
-            if self.jobs_queue.len() > 10 {
-                trace!("We reject running job: {:?}", self.jobs_running.first().unwrap().0);
-                return (None, Some(self.jobs_running.first().unwrap().0.job.id.clone()))
+            if self.jobs_queue.len() > 10 && self.jobs_running.get(0).unwrap().0.job.res <= 5 {
+                trace!("We reject running job: {:?}",
+                       self.jobs_running.first().unwrap().0);
+                return (None, Some(self.jobs_running.first().unwrap().0.job.id.clone()));
             }
         }
         (None, None)
@@ -114,7 +118,7 @@ impl SubScheduler {
     /// Ask the scheduler to update/set the scheduled release date
     /// of the given allocation. The idea is to have a prediction of
     /// the future.
-    pub fn job_waiting(&mut self, time: f64, allocation: Rc<Allocation>) {
+    fn job_waiting(&mut self, time: f64, allocation: Rc<Allocation>) {
 
         self.job_revert_allocation(allocation.clone());
 
@@ -148,14 +152,14 @@ impl SubScheduler {
     /// Add an empty allocation to the queue of the sub scheduler
     /// The job is wrapped by an allocation so we can share it through
     /// several schedulers.
-    pub fn add_job(&mut self, allocation: Rc<Allocation>) {
+    fn add_job(&mut self, allocation: Rc<Allocation>) {
         trace!("Jobs has been added: {:?}", allocation);
         self.jobs_queue.insert(0, allocation.clone());
     }
 
     /// Notify the sub scheduler that the job with id `finished_job`
     /// is done.
-    pub fn job_finished(&mut self, finished_job: String) {
+    fn job_finished(&mut self, finished_job: String) {
         //TODO Check if the job was running in this group
         trace!("Jobs has been completed: {}", finished_job);
         assert!(self.jobs_running.len() == 1);
@@ -164,7 +168,7 @@ impl SubScheduler {
     }
 
     /// Notify the sub scheduler whenever a job has been killed.
-    pub fn job_killed(&mut self, killed_job: String) {
+    fn job_killed(&mut self, killed_job: String) {
         //TODO Check if the job was running in this group
         assert!(self.jobs_running.len() == 1);
         self.jobs_running.retain(|x| killed_job != x.0.job.id);
@@ -172,7 +176,7 @@ impl SubScheduler {
     }
 
     /// notify the sub scheduler that a job has been lauched and thus voila
-    pub fn job_launched(&mut self, time: f64, job: String) {
+    fn job_launched(&mut self, time: f64, job: String) {
         // retrieve and remove the job from the waiting queue.
         trace!("Jobs has been launched: {} on {}", job, self.uuid);
         let idx = self.jobs_waiting
@@ -197,7 +201,7 @@ impl SubScheduler {
     /// from the waiting queue instead of the waiting queue.
     /// The next differences is that the allocation must be already
     /// defined.
-    pub fn job_backfilled(&mut self, time: f64, job: String) {
+    fn job_backfilled(&mut self, time: f64, job: String) {
         // retrieve and remove the job from the waiting queue.
         trace!("[{}]Jobs has been backfilled: {}", self.uuid, job);
         let idx = self.jobs_queue
@@ -216,12 +220,12 @@ impl SubScheduler {
         assert!(self.jobs_running.len() == 1);
     }
 
-    pub fn job_revert_allocation(&self, allocation: Rc<Allocation>) {
+    fn job_revert_allocation(&self, allocation: Rc<Allocation>) {
         allocation.remove_resources(self.resources.clone().to_interval_set());
         assert!(allocation.nb_of_res_to_complete() > 0);
     }
 
-    pub fn register_to_allocation(&self, allocation: Rc<Allocation>) {
+    fn register_to_allocation(&self, allocation: Rc<Allocation>) {
         allocation.add_group(self.uuid.clone());
     }
 
@@ -250,12 +254,7 @@ impl SubScheduler {
         allocation.clone()
     }
 
-    pub fn is_busy(&self) -> bool {
-        trace!("{} jobs running \t {} jobs waiting \t {} jobs in queue",
-               self.jobs_running.len(),
-               self.jobs_waiting.len(),
-
-               self.jobs_queue.len());
-        !self.jobs_running.is_empty()
+    fn get_uuid(&self) -> Uuid {
+        self.uuid.clone()
     }
 }

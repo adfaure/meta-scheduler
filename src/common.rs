@@ -7,6 +7,21 @@ use uuid::Uuid;
 use std::hash::{Hash, Hasher};
 use std::fmt;
 
+pub trait SubScheduler {
+    fn easy_back_filling(&mut self, current_time: f64) -> Vec<Rc<Allocation>>;
+    fn get_uuid(&self) -> Uuid;
+    fn schedule_jobs(&mut self, time: f64) -> (Option<Vec<Rc<Allocation>>>, Option<String>);
+    fn job_waiting(&mut self, time: f64, allocation: Rc<Allocation>);
+    fn add_job(&mut self, allocation: Rc<Allocation>);
+    fn job_finished(&mut self, finished_job: String);
+    fn job_killed(&mut self, killed_job: String);
+    fn job_launched(&mut self, time: f64, job: String);
+    fn job_backfilled(&mut self, time: f64, job: String);
+    fn job_revert_allocation(&self, allocation: Rc<Allocation>);
+    fn register_to_allocation(&self, allocation: Rc<Allocation>);
+    fn allocate_job(&self, allocation: Rc<Allocation>) -> Rc<Allocation>;
+}
+
 #[derive(Clone)]
 /// An allocation wrap a
 /// job with data such as the ressources allocated
@@ -19,13 +34,16 @@ pub struct Allocation {
     pub nodes: RefCell<IntervalSet>,
     //TODO `sheduled_lauched_time` Does not seems very english
     pub sheduled_lauched_time: Cell<f64>,
-    pub running_groups: RefCell<Vec<Uuid>>
+    pub running_groups: RefCell<Vec<Uuid>>,
 }
 
 impl fmt::Debug for Allocation {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "job: {}\t", self.job.id);
-        write!(f, "interval: {} - missing: {}", self.nodes.borrow().clone(), self.nb_of_res_to_complete())
+        write!(f,
+               "interval: {} - missing: {}",
+               self.nodes.borrow().clone(),
+               self.nb_of_res_to_complete())
     }
 }
 
@@ -73,7 +91,9 @@ impl Allocation {
         *self.nodes.borrow_mut() = interval.union(temp_interval);
 
         if self.running_groups.borrow().len() > 1 {
-            info!("Add resources: {:?} - Resources left {}", self, self.nb_of_res_to_complete());
+            trace!("Add resources: {:?} - Resources left {}",
+                   self,
+                   self.nb_of_res_to_complete());
         }
     }
 
