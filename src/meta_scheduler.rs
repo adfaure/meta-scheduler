@@ -184,8 +184,23 @@ impl Scheduler for MetaScheduler {
         info!("Simulation ends: {}", timestamp);
     }
 
-    fn on_job_killed(&mut self, _: &f64, jobs: Vec<String>) -> Option<Vec<BatsimEvent>> {
-        panic!("Job {:?} as been killed, please handle it.", jobs);
+    fn on_job_killed(&mut self, timestamp: &f64, jobs: Vec<String>) -> Option<Vec<BatsimEvent>> {
+        let mut events: Vec<BatsimEvent> = vec![];
+        for job_id in jobs {
+            trace!("Job {} has been succesfully killed", &job_id);
+
+            let rej_job = self.rejected_jobs
+                .get(&MetaScheduler::job_id_to_rej_id(&job_id))
+                .ok_or("Job killed unknown")
+                .unwrap()
+                .clone();
+            self.schedulers_for(rej_job.initial_job.clone(),
+                                &mut |scheduler| scheduler.job_killed(job_id.clone()));
+
+            let profile: Option<&Profile> = self.profiles.get(&rej_job.initial_job.job.profile);
+            events.push(submit_job_event(*timestamp, &rej_job.resub_job.job, profile));
+        }
+        Some(events)
     }
 
     fn on_message_received_end(&mut self, timestamp: &mut f64) -> Option<Vec<BatsimEvent>> {
@@ -205,10 +220,14 @@ impl Scheduler for MetaScheduler {
             trace!("{:?}", sch.1);
         }
 
-        events.extend(allocations_to_batsim_events(self.time, all_allocations));
+        events.extend(MetaScheduler::allocations_to_batsim_events(self.time, all_allocations));
 
         if !rejected.is_empty() {
-            events.push(batsim::kill_jobs_event(self.time, rejected.iter().map(|alloc| &*alloc.job ).collect()));
+            events.push(batsim::kill_jobs_event(self.time,
+                                                rejected
+                                                    .iter()
+                                                    .map(|alloc| &*alloc.job)
+                                                    .collect()));
         }
 
         trace!("Respond to batsim at: {} with {} events",
@@ -286,7 +305,6 @@ impl MetaScheduler {
             let rej_job = MetaScheduler::construct_rejected_job(reject.clone());
             self.rejected_jobs
                 .insert(rej_job.job_id.clone(), Rc::new(rej_job));
-
         }
 
         let (ready_allocations, delayed_allocations): (Vec<Rc<Allocation>>,
@@ -330,7 +348,7 @@ impl MetaScheduler {
         let job = allocation.job.clone();
 
         if job.res <= self.greater_grp_size as i32 {
-            let grp_idx = get_job_grp(&job);
+            let grp_idx = MetaScheduler::get_job_grp(&job);
             let uuid = self.schedulers.get(grp_idx).unwrap();
             let scheduler = self.schedulers_map
                 .get_mut(&uuid)
@@ -362,6 +380,11 @@ impl MetaScheduler {
         }
     }
 
+    fn job_id_to_rej_id(id: &String) -> String {
+        let (_, job_id) = Job::split_id(&id);
+        format!("rej!{}", job_id)
+    }
+
     fn construct_rejected_job(allocation: Rc<Allocation>) -> RejectedJob {
         let (_, job_id) = Job::split_id(&allocation.job.id);
 
@@ -376,17 +399,19 @@ impl MetaScheduler {
             finished: Cell::new(false),
         }
     }
-}
 
-fn get_job_grp(job: &Job) -> usize {
-    (job.res as f64).log(2_f64).ceil() as usize
-}
+    fn get_job_grp(job: &Job) -> usize {
+        (job.res as f64).log(2_f64).ceil() as usize
+    }
 
-fn allocations_to_batsim_events(now: f64, allocation: Vec<Rc<Allocation>>) -> Vec<BatsimEvent> {
-    allocation
-        .into_iter()
-        .map(|alloc| {
-                 return allocate_job_event(now, &*alloc.job, format!("{}", *alloc.nodes.borrow()));
-             })
-        .collect()
+    fn allocations_to_batsim_events(now: f64, allocation: Vec<Rc<Allocation>>) -> Vec<BatsimEvent> {
+        allocation
+            .into_iter()
+            .map(|alloc| {
+                     return allocate_job_event(now,
+                                               &*alloc.job,
+                                               format!("{}", *alloc.nodes.borrow()));
+                 })
+            .collect()
+    }
 }
