@@ -81,7 +81,10 @@ impl SubScheduler for SubSchedulerRejection {
     /// in order to get next job to schedule, and possibly a rejected job
     /// In addition I think it is not possible to allocate a job
     /// and reject one another job in the same time.
-    fn schedule_jobs(&mut self, time: f64) -> (Option<Vec<Rc<Allocation>>>, Option<String>) {
+    fn schedule_jobs(&mut self,
+                     time: f64,
+                     is_rejection_possible: &Fn(Rc<Allocation>) -> bool)
+                     -> (Option<Vec<Rc<Allocation>>>, Option<String>) {
         // If no jobs are yet running on this scheduler
         // we will allocate the next job.
         if self.jobs_running.len() == 0 {
@@ -106,7 +109,8 @@ impl SubScheduler for SubSchedulerRejection {
                 }
             }
         } else {
-            if self.jobs_queue.len() > 10 && self.jobs_running.get(0).unwrap().0.job.res <= 5 {
+            if self.jobs_queue.len() > 40 &&
+               is_rejection_possible(self.jobs_running.get(0).unwrap().0.clone()) {
                 trace!("We reject running job: {:?}",
                        self.jobs_running.first().unwrap().0);
                 return (None, Some(self.jobs_running.first().unwrap().0.job.id.clone()));
@@ -162,37 +166,64 @@ impl SubScheduler for SubSchedulerRejection {
     fn job_finished(&mut self, finished_job: String) {
         //TODO Check if the job was running in this group
         trace!("Jobs has been completed: {}", finished_job);
-        assert!(self.jobs_running.len() == 1);
         self.jobs_running.retain(|x| finished_job != x.0.job.id);
-        assert!(self.jobs_running.len() == 0);
     }
 
     /// Notify the sub scheduler whenever a job has been killed.
     fn job_killed(&mut self, killed_job: String) {
         //TODO Check if the job was running in this group
-        assert!(self.jobs_running.len() == 1);
+        //assert!(self.jobs_running.len() == 1);
         self.jobs_running.retain(|x| killed_job != x.0.job.id);
-        assert!(self.jobs_running.len() == 0);
+        //assert!(self.jobs_running.len() == 0);
     }
 
-    /// notify the sub scheduler that a job has been lauched and thus voila
-    fn job_launched(&mut self, time: f64, job: String) {
+    /// notify the sub scheduler that a job has been launched and thus voila
+    fn job_launched(&mut self, time: f64, alloc: Rc<Allocation>) {
         // retrieve and remove the job from the waiting queue.
-        trace!("Jobs has been launched: {} on {}", job, self.uuid);
-        let idx = self.jobs_waiting
-            .iter()
-            .position(|x| job == x.job.id)
-            .unwrap();
+        // In some cases, a job is attributed to a group,
+        // but the rejection scheduler may handles more resources than expected. Thus
+        // a job may not run in this group
+        if alloc
+               .nodes
+               .borrow()
+               .clone()
+               .intersection(self.resources.clone().to_interval_set())
+               .size() > 0 {
 
-        let alloc = self.jobs_waiting.remove(idx);
+            trace!("Jobs has been launched: {:?} on {}", alloc, self.uuid);
+            let idx = self.jobs_waiting
+                .iter()
+                .position(|x| alloc.job.id == x.job.id)
+                .unwrap();
 
-        assert!(self.jobs_waiting.is_empty());
-        assert!(job == alloc.job.id);
-        assert!(self.jobs_running.len() == 0);
+            let removed_alloc = self.jobs_waiting.remove(idx);
 
-        self.jobs_running
-            .push((alloc.clone(), time + alloc.job.walltime));
-        assert!(self.jobs_running.len() == 1);
+            assert!(self.jobs_waiting.is_empty());
+            assert!(alloc.job.id == removed_alloc.job.id);
+            assert!(self.jobs_running.len() == 0);
+            self.jobs_running
+                .push((removed_alloc.clone(), time + removed_alloc.job.walltime));
+            assert!(self.jobs_running.len() == 1);
+        } else {
+            // In this case we still need to remove this job from the job queue.
+            match self.jobs_queue
+                      .iter()
+                      .position(|x| alloc.job.id == x.job.id) {
+                Some(pos) => {
+                    let removed_alloc = self.jobs_queue.remove(pos);
+                }
+                None => {}
+
+            }
+            match self.jobs_waiting
+                      .iter()
+                      .position(|x| alloc.job.id == x.job.id) {
+                Some(pos) => {
+                    let removed_alloc = self.jobs_waiting.remove(pos);
+                }
+                None => {}
+            }
+        }
     }
 
     /// notify the sub scheduler that a job has been lauched from the waiting queue
@@ -233,8 +264,9 @@ impl SubScheduler for SubSchedulerRejection {
     fn allocate_job(&self, allocation: Rc<Allocation>) -> Rc<Allocation> {
         let interval;
 
-        // We ensure that the allocation is not already fullfilled
-        assert!(allocation.nb_of_res_to_complete() > 0);
+        if allocation.nb_of_res_to_complete() == 0 {
+            return allocation;
+        }
         if allocation.job.res <= self.resources.range_size() as i32 {
             // In this case the jobs can be lauched entirely into
             // the ressources of this scheduler.

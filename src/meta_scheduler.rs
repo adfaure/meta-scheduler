@@ -69,7 +69,8 @@ impl Scheduler for MetaScheduler {
         let nb_grps: u32 = (nb_resources as f64).log(2_f64).floor() as u32;
 
         //The maximun job size accepted
-        self.max_job_size = (2 as u32).pow(nb_grps) as usize - 1;
+        //self.max_job_size = (2 as u32).pow(nb_grps) as usize - 1;
+        self.max_job_size = nb_resources as usize - 1;
 
         //The size of the greatest group of resources.
         self.greater_grp_size = (2 as u32).pow(nb_grps - 1) as usize;
@@ -97,10 +98,11 @@ impl Scheduler for MetaScheduler {
                 Box::new(SubSchedulerRejection::new(interval.clone()));
 
             nb_machines_used += interval.range_size();
-            info!("Groupe(n={}) uses {} nodes: {:?}",
+            info!("Groupe(n={}) uses {} nodes: {:?} id: {}",
                   idx,
                   interval.range_size(),
-                  interval);
+                  interval,
+                  scheduler.get_uuid());
 
             self.schedulers
                 .insert(idx as usize, scheduler.get_uuid());
@@ -108,14 +110,16 @@ impl Scheduler for MetaScheduler {
                 .insert(scheduler.get_uuid(), scheduler);
         }
 
-        info!("We use only {} over {}",
-              nb_machines_used,
-              self.nb_resources);
 
         self.nb_dangling_resources = (self.nb_resources - nb_machines_used) as i32;
         if self.nb_dangling_resources <= 0 {
             panic!("No ressource available for rejection");
         }
+
+        info!("We use only {} over {}: {}",
+              nb_machines_used,
+              self.nb_resources,
+              self.nb_dangling_resources);
 
         let scheduler: Box<SubScheduler> =
             Box::new(SubSchedulerFcfs::new(Interval::new(nb_machines_used, self.nb_resources - 1)));
@@ -213,11 +217,9 @@ impl Scheduler for MetaScheduler {
         //We call a standar scheduler on each sub groups
         let (jobs, rejected) = self.schedule_jobs();
         let bf = self.easy_backfilling();
-        let rej = self.schedule_rejection_scheduler();
 
         all_allocations.extend(jobs);
         all_allocations.extend(bf);
-        all_allocations.extend(rej);
 
         events.extend(MetaScheduler::allocations_to_batsim_events(self.time, all_allocations));
 
@@ -273,12 +275,15 @@ impl MetaScheduler {
 
     fn schedule_rejection_scheduler(&mut self) -> Vec<Rc<Allocation>> {
         let mut all_allocations: Vec<Rc<Allocation>> = vec![];
+
         {
             let mut scheduler = self.schedulers_map
                 .get_mut(&self.rejection_scheduler)
                 .expect("No scheduler for the given uuid");
 
-            let (allocations, rejected) = scheduler.schedule_jobs(self.time);
+            let cb = |j: Rc<Allocation>| false;
+            let mut rejected_jobs: Vec<Rc<Allocation>> = vec![];
+            let (allocations, rejected) = scheduler.schedule_jobs(self.time, &cb);
             match allocations {
                 Some(allocs) => {
                     all_allocations.extend(allocs);
@@ -292,18 +297,6 @@ impl MetaScheduler {
             }
         }
 
-        // We notify every scheduler wereas we launch one
-        // of the jobs.
-        let time: f64 = self.time;
-        for ready_allocation in &all_allocations {
-            self.schedulers_for(ready_allocation.clone(),
-                                &mut |scheduler| {
-                                         scheduler.job_launched(time,
-                                                                ready_allocation.job.id.clone())
-                                     });
-        }
-
-
         all_allocations
     }
 
@@ -313,13 +306,16 @@ impl MetaScheduler {
 
         let mut rejected_jobs: Vec<Rc<Allocation>> = vec![];
 
+        let dang = self.nb_dangling_resources;
+        let cb = |j: Rc<Allocation>| j.job.res <= dang;
+
         // In the first place we call for a normal schedule on each scheduler
         for scheduler_id in &self.schedulers {
             let mut scheduler = self.schedulers_map
                 .get_mut(scheduler_id)
                 .expect("No scheduler for the given uuid");
 
-            let (allocations, rejected) = scheduler.schedule_jobs(self.time);
+            let (allocations, rejected) = scheduler.schedule_jobs(self.time, &cb);
             match allocations {
                 Some(allocs) => {
                     all_allocations.extend(allocs);
@@ -335,7 +331,7 @@ impl MetaScheduler {
             }
         }
 
-
+        all_allocations.extend(self.schedule_rejection_scheduler());
 
         for reject in &rejected_jobs {
             trace!("Job {:?} has been rejected", reject);
@@ -366,8 +362,7 @@ impl MetaScheduler {
         for ready_allocation in &ready_allocations {
             self.schedulers_for(ready_allocation.clone(),
                                 &mut |scheduler| {
-                                         scheduler.job_launched(time,
-                                                                ready_allocation.job.id.clone())
+                                         scheduler.job_launched(time, ready_allocation.clone())
                                      });
         }
 
@@ -421,7 +416,15 @@ impl MetaScheduler {
                                 allocation.add_group(scheduler.get_uuid());
                                 cores_remaining -= 2i32.pow(idx_scheduler.0 as u32);
                             }
-                            None => break,
+                            None => {
+                                if cores_remaining > 0 {
+                                    trace!("Job also needs resources from rej: {:?} - {}",
+                                           allocation,
+                                           self.rejection_scheduler.clone());
+                                    allocation.add_group(self.rejection_scheduler.clone());
+                                }
+                                break;
+                            }
                         }
                         sched = iter_sched.next();
                     }

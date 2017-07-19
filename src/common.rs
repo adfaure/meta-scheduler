@@ -10,12 +10,15 @@ use std::fmt;
 pub trait SubScheduler {
     fn easy_back_filling(&mut self, current_time: f64) -> Vec<Rc<Allocation>>;
     fn get_uuid(&self) -> Uuid;
-    fn schedule_jobs(&mut self, time: f64) -> (Option<Vec<Rc<Allocation>>>, Option<String>);
+    fn schedule_jobs(&mut self,
+                     time: f64,
+                     is_rejection_possible: &Fn(Rc<Allocation>) -> bool)
+                     -> (Option<Vec<Rc<Allocation>>>, Option<String>);
     fn job_waiting(&mut self, time: f64, allocation: Rc<Allocation>);
     fn add_job(&mut self, allocation: Rc<Allocation>);
     fn job_finished(&mut self, finished_job: String);
     fn job_killed(&mut self, killed_job: String);
-    fn job_launched(&mut self, time: f64, job: String);
+    fn job_launched(&mut self, time: f64, alloc: Rc<Allocation>);
     fn job_backfilled(&mut self, time: f64, job: String);
     fn job_revert_allocation(&self, allocation: Rc<Allocation>);
     fn register_to_allocation(&self, allocation: Rc<Allocation>);
